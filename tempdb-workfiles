@@ -1,0 +1,43 @@
+--who is holding Sch-M right now
+
+;WITH waits AS (
+  SELECT r.session_id, r.blocking_session_id, r.wait_type, r.command, r.sql_handle, r.plan_handle
+  FROM sys.dm_exec_requests r
+  WHERE r.wait_type = 'LCK_M_SCH_M'
+)
+SELECT w.session_id AS waiter_sid, w.blocking_session_id AS blocker_sid, w.wait_type,
+       req.command AS blocker_cmd,
+       DB_NAME(req.database_id) AS db_name,
+       OBJECT_SCHEMA_NAME(p.object_id, req.database_id) AS sch,
+       OBJECT_NAME(p.object_id, req.database_id) AS obj
+FROM waits w
+JOIN sys.dm_exec_requests req ON req.session_id = w.blocking_session_id
+LEFT JOIN sys.dm_tran_locks l ON l.request_session_id = w.blocking_session_id AND l.resource_associated_entity_id IS NOT NULL
+LEFT JOIN sys.partitions p ON p.hobt_id = l.resource_associated_entity_id
+ORDER BY blocker_sid;
+
+--XE for auto_stats firing
+CREATE EVENT SESSION [auto_stats_watch] ON SERVER
+ADD EVENT sqlserver.auto_stats,
+ADD EVENT sqlserver.auto_stats_update,
+ADD EVENT sqlserver.auto_stats_update_finished
+ADD TARGET package0.ring_buffer;
+ALTER EVENT SESSION [auto_stats_watch] ON SERVER STATE = START;
+
+--who's spilling to tempdb
+SELECT r.session_id, r.request_id, r.cpu_time, r.granted_query_memory,
+       tsu.user_objects_alloc_page_count, tsu.internal_objects_alloc_page_count
+FROM sys.dm_exec_requests r
+JOIN sys.dm_db_task_space_usage tsu
+  ON tsu.session_id = r.session_id AND tsu.request_id = r.request_id
+WHERE r.database_id = DB_ID();  -- or your DB
+
+
+--XE for tempdb spills
+CREATE EVENT SESSION [spills_watch] ON SERVER
+ADD EVENT sqlserver.query_execution_plan_profile( -- lightweight actuals
+    ACTION(sqlserver.sql_text, sqlserver.plan_handle) WHERE (is_trivial_plan=0)),
+ADD EVENT sqlserver.sort_warning,
+ADD EVENT sqlserver.hash_warning
+ADD TARGET package0.ring_buffer;
+ALTER EVENT SESSION [spills_watch] ON SERVER STATE = START;
