@@ -1,0 +1,37 @@
+-- Get all partitioned tables (both native and pg_partman)
+WITH partitioned_tables AS (
+    SELECT c.oid, c.relname AS table_name, 'native' AS partitioning_type
+    FROM pg_class c
+    JOIN pg_partitioned_table pt ON c.oid = pt.partrelid
+
+    UNION
+
+    SELECT c.oid, c.relname AS table_name, 'partman' AS partitioning_type
+    FROM pg_class c
+    JOIN partman.part_config pc ON c.relname = pc.parent_table
+),
+
+-- Check for future partitions using partition bounds
+future_partitions AS (
+    SELECT 
+        pt.table_name, 
+        pt.partitioning_type,
+        EXISTS (
+            SELECT 1
+            FROM pg_inherits i
+            JOIN pg_class child ON i.inhrelid = child.oid
+            JOIN pg_partitioned_table parent ON i.inhparent = parent.partrelid
+            JOIN pg_class parent_class ON parent.partrelid = parent_class.oid
+            JOIN pg_range_bounds() rb ON parent.partrelid = rb.partoid
+            WHERE parent_class.oid = pt.oid
+              AND rb.range_end > CURRENT_DATE -- or another logical future boundary
+        ) AS has_future_partitions
+    FROM partitioned_tables pt
+)
+
+-- Final result showing tables and if they have future partitions
+SELECT 
+    table_name, 
+    partitioning_type, 
+    has_future_partitions
+FROM future_partitions;
