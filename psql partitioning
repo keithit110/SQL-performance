@@ -1,37 +1,85 @@
--- Get all partitioned tables (both native and pg_partman)
-WITH partitioned_tables AS (
-    SELECT c.oid, c.relname AS table_name, 'native' AS partitioning_type
-    FROM pg_class c
-    JOIN pg_partitioned_table pt ON c.oid = pt.partrelid
-
-    UNION
-
-    SELECT c.oid, c.relname AS table_name, 'partman' AS partitioning_type
-    FROM pg_class c
-    JOIN partman.part_config pc ON c.relname = pc.parent_table
-),
-
--- Check for future partitions using partition bounds
-future_partitions AS (
-    SELECT 
-        pt.table_name, 
-        pt.partitioning_type,
-        EXISTS (
-            SELECT 1
-            FROM pg_inherits i
-            JOIN pg_class child ON i.inhrelid = child.oid
-            JOIN pg_partitioned_table parent ON i.inhparent = parent.partrelid
-            JOIN pg_class parent_class ON parent.partrelid = parent_class.oid
-            JOIN pg_range_bounds() rb ON parent.partrelid = rb.partoid
-            WHERE parent_class.oid = pt.oid
-              AND rb.range_end > CURRENT_DATE -- or another logical future boundary
-        ) AS has_future_partitions
-    FROM partitioned_tables pt
+--all partitioned parent tables + partition key + strategy + whether pg_partman tracks it
+WITH parents AS (
+  SELECT
+      p.partrelid                                           AS parent_oid,
+      ns.nspname                                            AS parent_schema,
+      c.relname                                             AS parent_table,
+      format('%I.%I', ns.nspname, c.relname)                 AS parent_fqname,
+      CASE p.partstrat
+        WHEN 'r' THEN 'range'
+        WHEN 'l' THEN 'list'
+        WHEN 'h' THEN 'hash'
+      END                                                   AS partition_strategy,
+      pg_get_partkeydef(p.partrelid)                         AS partition_key_def
+  FROM pg_partitioned_table p
+  JOIN pg_class c     ON c.oid = p.partrelid
+  JOIN pg_namespace ns ON ns.oid = c.relnamespace
+  WHERE ns.nspname NOT IN ('pg_catalog', 'information_schema')
 )
+SELECT
+    p.parent_schema,
+    p.parent_table,
+    p.partition_strategy,
+    p.partition_key_def,
+    CASE WHEN pc.parent_table IS NOT NULL THEN true ELSE false END AS is_partman_configured
+FROM parents p
+LEFT JOIN partman.part_config pc
+  ON pc.parent_table = p.parent_fqname
+ORDER BY p.parent_schema, p.parent_table;
 
--- Final result showing tables and if they have future partitions
-SELECT 
-    table_name, 
-    partitioning_type, 
-    has_future_partitions
-FROM future_partitions;
+--every partition child table + its exact bound expression (trusted, not based on names)
+WITH parents AS (
+  SELECT
+      p.partrelid                                           AS parent_oid,
+      ns.nspname                                            AS parent_schema,
+      c.relname                                             AS parent_table,
+      format('%I.%I', ns.nspname, c.relname)                 AS parent_fqname,
+      pg_get_partkeydef(p.partrelid)                         AS partition_key_def
+  FROM pg_partitioned_table p
+  JOIN pg_class c      ON c.oid = p.partrelid
+  JOIN pg_namespace ns ON ns.oid = c.relnamespace
+  WHERE ns.nspname NOT IN ('pg_catalog', 'information_schema')
+)
+SELECT
+    pr.parent_schema,
+    pr.parent_table,
+    pr.partition_key_def,
+    ch_ns.nspname                                 AS child_schema,
+    ch.relname                                    AS child_table,
+    format('%I.%I', ch_ns.nspname, ch.relname)     AS child_fqname,
+    pg_get_expr(ch.relpartbound, ch.oid)           AS child_bound_expr,
+    CASE WHEN pc.parent_table IS NOT NULL THEN true ELSE false END AS is_partman_configured
+FROM parents pr
+JOIN pg_inherits i     ON i.inhparent = pr.parent_oid
+JOIN pg_class ch       ON ch.oid = i.inhrelid
+JOIN pg_namespace ch_ns ON ch_ns.oid = ch.relnamespace
+LEFT JOIN partman.part_config pc
+  ON pc.parent_table = pr.parent_fqname
+ORDER BY pr.parent_schema, pr.parent_table, child_schema, child_table;
+
+
+--per parent table, how many partitions + whether a DEFAULT partition exists
+WITH parents AS (
+  SELECT
+      p.partrelid                               AS parent_oid,
+      format('%I.%I', ns.nspname, c.relname)     AS parent_fqname
+  FROM pg_partitioned_table p
+  JOIN pg_class c      ON c.oid = p.partrelid
+  JOIN pg_namespace ns ON ns.oid = c.relnamespace
+  WHERE ns.nspname NOT IN ('pg_catalog', 'information_schema')
+),
+children AS (
+  SELECT
+      pr.parent_fqname,
+      pg_get_expr(ch.relpartbound, ch.oid) AS bound_expr
+  FROM parents pr
+  JOIN pg_inherits i ON i.inhparent = pr.parent_oid
+  JOIN pg_class ch   ON ch.oid = i.inhrelid
+)
+SELECT
+    parent_fqname,
+    count(*) AS partition_count,
+    bool_or(bound_expr ILIKE '%DEFAULT%') AS has_default_partition
+FROM children
+GROUP BY parent_fqname
+ORDER BY parent_fqname;
