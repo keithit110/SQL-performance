@@ -8,7 +8,7 @@ range_parents AS (
   SELECT
     p.partrelid AS parent_oid,
     format('%I.%I', pn.nspname, pc.relname) AS parent_fqname,
-    pg_get_partkeydef(p.partrelid) AS partition_key_def
+    pg_get_partkeydef(p.partrelid)          AS partition_key_def
   FROM pg_partitioned_table p
   JOIN pg_class pc      ON pc.oid = p.partrelid
   JOIN pg_namespace pn  ON pn.oid = pc.relnamespace
@@ -36,15 +36,33 @@ child_tos AS (
     END AS to_ts
   FROM child_bounds
 ),
+ranked AS (
+  -- Rank partitions by TO bound (latest first). Ignore DEFAULT for ranking.
+  SELECT
+    ct.*,
+    row_number() OVER (
+      PARTITION BY parent_fqname
+      ORDER BY to_ts DESC NULLS LAST
+    ) AS rn
+  FROM child_tos ct
+  WHERE ct.is_default = false
+    AND ct.to_ts IS NOT NULL
+),
 rollup AS (
   SELECT
-    parent_fqname,
-    partition_key_def,
-    bool_or(is_default) AS has_default_partition,
-    max(to_ts) AS latest_to_ts,
-    max(to_ts) FILTER (WHERE to_ts < max(to_ts)) AS prev_to_ts
-  FROM child_tos
-  GROUP BY parent_fqname, partition_key_def
+    p.parent_fqname,
+    p.partition_key_def,
+    -- DEFAULT may exist even if we filtered it out of ranked; compute from child_tos
+    (SELECT bool_or(is_default) FROM child_tos ct2 WHERE ct2.parent_fqname = p.parent_fqname) AS has_default_partition,
+    max(to_ts) FILTER (WHERE rn = 1) AS latest_to_ts,
+    max(to_ts) FILTER (WHERE rn = 2) AS prev_to_ts
+  FROM (
+    SELECT DISTINCT parent_fqname, partition_key_def
+    FROM child_tos
+  ) p
+  LEFT JOIN ranked r
+    ON r.parent_fqname = p.parent_fqname
+  GROUP BY p.parent_fqname, p.partition_key_def
 ),
 final AS (
   SELECT
