@@ -24,6 +24,27 @@ child_bounds AS (
   JOIN pg_inherits i ON i.inhparent = rp.parent_oid
   JOIN pg_class ch   ON ch.oid = i.inhrelid
 ),
+child_bounds AS (
+  SELECT
+    rp.parent_fqname,
+    rp.partition_key_def,
+    ch.oid AS child_oid,
+    format('%I.%I', ch_ns.nspname, ch.relname) AS child_fqname,
+    pg_get_expr(ch.relpartbound, ch.oid) AS bound_expr
+  FROM range_parents rp
+  JOIN pg_inherits i ON i.inhparent = rp.parent_oid
+  JOIN pg_class ch   ON ch.oid = i.inhrelid
+  JOIN pg_namespace ch_ns ON ch_ns.oid = ch.relnamespace
+),
+default_part AS (
+  SELECT
+    parent_fqname,
+    max(child_oid)    AS default_child_oid,
+    max(child_fqname) AS default_child_fqname
+  FROM child_bounds
+  WHERE bound_expr = 'DEFAULT'
+  GROUP BY parent_fqname
+),
 child_tos AS (
   SELECT
     parent_fqname,
@@ -73,6 +94,25 @@ final AS (
       ELSE 'other'
     END AS cadence
   FROM rollup r
+)
+final AS (
+  SELECT
+    r.*,
+    dp.default_child_fqname,
+
+    /* estimated live rowcount in DEFAULT partition */
+    CASE
+      WHEN dp.default_child_oid IS NULL THEN NULL
+      ELSE COALESCE(st.n_live_tup::bigint, cls.reltuples::bigint)
+    END AS default_partition_rows_est
+
+  FROM rollup r
+  LEFT JOIN default_part dp
+    ON dp.parent_fqname = r.parent_fqname
+  LEFT JOIN pg_stat_all_tables st
+    ON st.relid = dp.default_child_oid
+  LEFT JOIN pg_class cls
+    ON cls.oid = dp.default_child_oid
 )
 SELECT
   f.parent_fqname,
